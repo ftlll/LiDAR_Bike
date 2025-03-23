@@ -2,7 +2,7 @@
 
 ## Intro
 
-[Description]([https://github.com/ftlll/LiDAR_Bike/blob/main/Assessment.pdf])
+[Description](./Assessment.pdf)
 
 ## Dependencies
 
