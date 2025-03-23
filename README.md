@@ -2,9 +2,9 @@
 
 ## Intro
 
-[Description](<[https://www.cnblogs.com/azureology/p/14004131.html](https://github.com/ftlll/LiDAR_Bike/blob/main/Assessment.pdf)>)
+[Description]([https://github.com/ftlll/LiDAR_Bike/blob/main/Assessment.pdf])
 
-## Dependencices
+## Dependencies
 
 ```
 conda create -n LiDAR python=3.8
