@@ -4,7 +4,7 @@
 
 [Description](<[https://www.cnblogs.com/azureology/p/14004131.html](https://github.com/ftlll/LiDAR_Bike/blob/main/Assessment.pdf)>)
 
-## Dependices
+## Dependencices
 
 ```
 conda create -n LiDAR python=3.8
