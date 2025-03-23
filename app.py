@@ -1,22 +1,19 @@
 import os
 import re
-import struct
 import json
 import numpy as np
 import pandas as pd
+import cv2
+import struct
 from pathlib import Path
 from flask import Flask, request, jsonify
 
-BASE_PATH = "data_q123"
-LIDAR_PATH = os.path.join(BASE_PATH, "lidar/data/")
-IMAGE_PATH = os.path.join(BASE_PATH, "image_02/data/")
-
 #########################################
 ##
-## Step 1: Reading Sensor Data
+## Step 0: Preparation
 ##
 #########################################
-
+# What is IMU https://www.youtube.com/watch?v=fG-JQlzQxWQ
 # imu.json: {
 #   timestamp: float,
 #   angular_velocity: {
@@ -29,12 +26,20 @@ IMAGE_PATH = os.path.join(BASE_PATH, "image_02/data/")
 
 # gps.json: {
 #   timestamp: float,
-#   latitude: float,
-#   longitude: float,
-#   altitude: float
+#   latitude: float,     x
+#   longitude: float,    y
+#   altitude: float      z
 #  }[]
+BASE_PATH = "data_q123"
+BONUS_PATH = "data_bonus"
 
-def read_image(file_path):
+#########################################
+##
+## Step 1: Reading Sensor Data
+##
+#########################################
+
+def load_image(file_path):
     f = open(f'{file_path}', 'rb')
     width, height = struct.unpack("II", f.read(8))
     image_data = np.frombuffer(f.read(), dtype=np.uint8)
@@ -44,49 +49,52 @@ def read_image(file_path):
     file_name = file_path.name
     match = re.search(r"image_(\d{10})_(\d{9})\.bin", file_name)
     if match:
-        timestamp = float(f"{match.group(1)}.{match.group(2)}")
+        timestamp = [float(f"{match.group(1)}.{match.group(2)}"), file_name]
 
     return image, timestamp
 
-def read_LiDAR(file_path):
+def load_LiDAR(file_path):
     points = np.fromfile(file_path, dtype=np.float32).reshape(-1, 4)
 
     file_name = file_path.name
     match = re.search(r"lidar_(\d{10})_(\d{9})\.bin", file_name)
     if match:
-        timestamp = float(f"{match.group(1)}.{match.group(2)}")
+        timestamp = [float(f"{match.group(1)}.{match.group(2)}"), file_name]
 
     return points, timestamp
 
-def read_json(file_path):
+def load_json(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
-    return data
+    return pd.DataFrame(data)
 
-def read_data(folder):
-    gps_data = read_json(f"{folder}/gps.json")
-    imu_data = read_json(f"{folder}/imu.json")
+def load_files(folder_path):
+    LIDAR_PATH = os.path.join(folder_path, "lidar/")
+    IMAGE_PATH = os.path.join(folder_path, "images/")
+    GPS_PATH = os.path.join(folder_path, "gps.json")
+    IMU_PATH = os.path.join(folder_path, "imu.json")
 
-    gps_df = pd.DataFrame(gps_data)
-    imu_df = pd.DataFrame(imu_data)
+    gps_df = load_json(GPS_PATH)
+    imu_df = load_json(IMU_PATH)
 
     images = []
     image_timestamps = []
-    image_folder = Path(f'{folder}/images')
+    image_folder = Path(IMAGE_PATH)
     for img_file in sorted(image_folder.iterdir()):
         if img_file.suffix == ".bin":
-            img_data, timestamp = read_image(img_file)
-            images.append(img_data)
+            img, timestamp = load_image(img_file)
+            print(timestamp)
+            images.append(img)
             image_timestamps.append(timestamp)
     images = np.array(images)
 
     lidars = []
     lidar_timestamps = []
-    lidar_folder = Path(f'{folder}/lidar')
+    lidar_folder = Path(LIDAR_PATH)
     for lidar_file in sorted(lidar_folder.iterdir()):
         if lidar_file.suffix == ".bin":
-            lidar_data, timestamp = read_LiDAR(lidar_file)
-            lidars.append(lidar_data)
+            points, timestamp = load_LiDAR(lidar_file)
+            lidars.append(points)
             lidar_timestamps.append(timestamp)
     lidars = np.array(lidars)
 
@@ -99,42 +107,65 @@ def read_data(folder):
 #########################################
 
 def closest_index(timestamps, reference_timestamp):
-    differences = [abs(t - reference_timestamp) for t in timestamps]
-    return differences.index(min(differences))
+    diff = [abs(t[0] - reference_timestamp) for t in timestamps]
+    return diff.index(min(diff))
+
+def linear_interp(v1, v2, t1, t2, t):
+    return v1 + (v2 - v1) * (t - t1) / (t2 - t1)
+
+def gps_interp(timestamp, gps_df):
+    if timestamp < gps_df.iloc[0]["timestamp"]:
+        return gps_df.iloc[0].to_dict()
+    if timestamp > gps_df.iloc[-1]["timestamp"]:
+        return gps_df.iloc[-1].to_dict()
+
+    index = (gps_df["timestamp"] > timestamp).idxmax()
+    gps1 = gps_df.iloc[index - 1]
+    gps2 = gps_df.iloc[index]
+    t1 = gps1['timestamp']
+    t2 = gps2['timestamp']
+
+    lat_interp = linear_interp(gps1["latitude"], gps2["latitude"], t1, t2, timestamp)
+    lon_interp = linear_interp(gps1["longitude"], gps2["longitude"], t1, t2, timestamp)
+    alt_interp = linear_interp(gps1["altitude"], gps2["altitude"], t1, t2, timestamp)
+
+    return {
+        "timestamp": timestamp,
+        "latitude": lat_interp,
+        "longitude": lon_interp,
+        "altitude": alt_interp
+    }
 
 def synchronize_sensor_data(gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps):
-    # output: list of sync data contains all four sensors
     sync_data = []
     reference_timestamps = []
 
-    ## compare frame rate
-    frame_img = (image_timestamps[-1] - image_timestamps[0]) / len(image_timestamps)
-    frame_lidar = (lidar_timestamps[-1] - lidar_timestamps[0]) / len(lidar_timestamps)
+    ## compare average frame rate
+    img_fps = len(image_timestamps) / (image_timestamps[-1][0] - image_timestamps[0][0])
+    lidar_fps = len(lidar_timestamps) / (lidar_timestamps[-1][0] - lidar_timestamps[0][0])
+    reference_timestamps = image_timestamps if lidar_fps > img_fps else lidar_timestamps
 
-    reference_timestamps = max(frame_img, frame_lidar)
-    # based on my observation, it seems images and lidars have close timestamp range
-    # TODO: also, we need to make sure about the timestamp range
-
-    for reference_timestamp in reference_timestamps:
+    for reference_timestamp, _ in reference_timestamps:
         closest_image_idx = closest_index(image_timestamps, reference_timestamp)
-        # print("closest_image_idx", closest_image_idx)
         closest_image = images[closest_image_idx]
+        image_timestamp = image_timestamps[closest_image_idx]
         closest_lidar_idx = closest_index(lidar_timestamps, reference_timestamp)
-        # print("closest_lidar_idx", closest_lidar_idx)
         closest_lidar = lidars[closest_lidar_idx]
-        closest_gpu = gps_df.iloc[(gps_df['timestamp'] - reference_timestamp).abs().idxmin()]
+        lidar_timestamp = lidar_timestamps[closest_lidar_idx]
         closest_imu = imu_df.iloc[(imu_df['timestamp'] - reference_timestamp).abs().idxmin()]
+        gps = gps_interp(reference_timestamp, gps_df)
         sync_data.append({
-            "gpu": closest_gpu,
-            "imu": closest_imu,
-            "image": closest_image,
-            "lidar": closest_lidar,
+            "gps": gps,
+            "imu": closest_imu.to_dict(),
+            "image": image_timestamp[1],
+            "lidar": lidar_timestamp[1],
         })
 
     return sync_data
 
-# gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps = read_data(folder)
+# gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps = load_data(BASE_PATH)
 # sync_data = synchronize_sensor_data(gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps)
+# print(sync_data)
 
 #########################################
 ##
@@ -144,21 +175,16 @@ def synchronize_sensor_data(gps_df, imu_df, images, lidars, image_timestamps, li
 
 app = Flask(__name__)
 
-@app.route('/sync_data', methods=['POST'])
+@app.route('/sync_data', methods=['GET'])
 def sync_data():
-    """API endpoint to synchronize sensor data from a given folder."""
-    data = request.json
-    folder_path = data.get("folder_path")
-    if not folder_path or not os.path.exists(folder_path):
+    folder_path = request.args.get("folder_path")
+    if not folder_path:
         return jsonify({"error": "Invalid folder path"}), 400
 
-    gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps = read_data(folder_path)
+    gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps = load_files(folder_path)
     synchronized_data = synchronize_sensor_data(gps_df, imu_df, images, lidars, image_timestamps, lidar_timestamps)
 
     return jsonify(synchronized_data)
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000, debug=True)
 
 #########################################
 ##
@@ -195,3 +221,87 @@ if __name__ == "__main__":
 ## coordinate system of the left video camera. Likewise it serves as a
 ## representation of the Velodyne coordinate frame in camera coordinates.
 
+CALIB_PATH = os.path.join(BONUS_PATH, "calib/")
+LIDAR_PATH = os.path.join(BONUS_PATH, "lidar/data/")
+IMAGE_PATH = os.path.join(BONUS_PATH, "image_02/data/")
+OUTPUT_PATH = os.path.join(BONUS_PATH, "output/")
+
+# create output path
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+# load matrices might be useful
+def load_calib(file_path):
+    data = {}
+    with open(f'{file_path}', 'r') as f:
+        for line in f.readlines():
+            key, value = line.split(':', 1)
+            if key == "P_rect_02":
+                data[key] = np.array([float(x) for x in value.split()]).reshape(3, 4)
+            elif key == "P_02" or key == "R":
+                data[key] = np.array([float(x) for x in value.split()]).reshape(3, 3)
+            elif key == "T":
+                data[key] = np.array([float(x) for x in value.split()]).reshape(3, 1)
+    return data
+
+c2c_path = os.path.join(CALIB_PATH, "calib_cam_to_cam.txt")
+cam_to_cam_data = load_calib(c2c_path)
+v2c_path = os.path.join(CALIB_PATH, "calib_velo_to_cam.txt")
+velo_to_cam_data = load_calib(v2c_path)
+
+P_rect_02 = cam_to_cam_data['P_rect_02']
+R_velo_to_cam = velo_to_cam_data['R']
+T_velo_to_cam = velo_to_cam_data['T']
+
+def transform_lidar_to_camera(lidar_points):
+    # we only need (x, y, z) for each points
+    xyz_points = lidar_points[:, :3]
+    cam_points = (R_velo_to_cam @ xyz_points.T + T_velo_to_cam).T
+    return cam_points
+
+def project_to_image(points):
+    # P_rect_02 is 3*4, we need homogenous coordinates
+    points_hom = np.hstack((points, np.ones((points.shape[0], 1))))
+    points_2s = (P_rect_02 @ points_hom.T).T
+    points_2s = points_2s[:, :2] / points_2s[:, 2:]
+    return points_2s
+
+def overlay_lidar_on_image(image, pts_2d, depths):
+    # adjust depth to range [0, 255]
+    depth_min, depth_max = depths.min(), depths.max()
+    depths_adjusted = ((depths - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+
+    colors = cv2.applyColorMap(depths_adjusted.reshape(-1, 1), cv2.COLORMAP_JET).squeeze()
+
+    for (x, y), color in zip(pts_2d.astype(int), colors):
+        if 0 <= x < image.shape[1] and 0 <= y < image.shape[0]:
+            cv2.circle(image, (x, y), 2, tuple(int(c) for c in color), -1)
+
+    return image
+
+@app.route('/bonus', methods=['GET'])
+def bonus():
+    frame = request.args.get('frame', type=int)
+    if frame is None:
+        return jsonify({"error": "Frame number required"}), 400
+
+    image_file = os.path.join(IMAGE_PATH, f"{frame:010d}.png")
+    lidar_file = os.path.join(LIDAR_PATH, f"{frame:010d}.bin")
+    output_file = os.path.join(OUTPUT_PATH, f"{frame:010d}.png")
+
+    if not os.path.exists(image_file) or not os.path.exists(lidar_file):
+        return jsonify({"error": "Frame not found"}), 404
+
+    lidar_points = np.fromfile(lidar_file, dtype=np.float32).reshape(-1, 4)
+    cam_points = transform_lidar_to_camera(lidar_points)
+    cam_points = cam_points[cam_points[:, 2] > 0]
+    img_points = project_to_image(cam_points)
+    depths = cam_points[:, 2]
+
+    image = cv2.imread(image_file)
+    image_with_lidar = overlay_lidar_on_image(image, img_points, depths)
+    cv2.imwrite(output_file, image_with_lidar)
+
+    return jsonify({"output_image": output_file})
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=3000, debug=True)
