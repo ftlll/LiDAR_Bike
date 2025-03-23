@@ -188,7 +188,7 @@ def sync_data():
 
 #########################################
 ##
-## Bonus: Synchronizing Sensor Data
+## Bonus: KITTI
 ##
 #########################################
 ## Useful Links:
@@ -197,6 +197,7 @@ def sync_data():
 ## https://github.com/yanii/kitti-pcl/blob/master/KITTI_README.TXT
 ## original paper: https://www.cvlibs.net/publications/Geiger2013IJRR.pdf
 ## reference: https://github.com/MikeS96/lidar_cam_sonar/blob/master/image_laser_fusion.ipynb
+##            https://github.com/azureology/kitti-velo2cam/blob/master/proj_velo2cam.py
 ##
 ## calib_cam_to_cam.txt: Camera-to-camera calibration
 ## --------------------------------------------------
@@ -261,9 +262,11 @@ def transform_lidar_to_camera(lidar_points):
 def project_to_image(points):
     # P_rect_02 is 3*4, we need homogenous coordinates
     points_hom = np.hstack((points, np.ones((points.shape[0], 1))))
-    points_2s = (P_rect_02 @ points_hom.T).T
-    points_2s = points_2s[:, :2] / points_2s[:, 2:]
-    return points_2s
+    points_2d = (P_rect_02 @ points_hom.T).T
+
+    # get u,v,z
+    points_2d = points_2d[:, :2] / points_2d[:, 2:]
+    return points_2d
 
 def overlay_lidar_on_image(image, pts_2d, depths):
     # adjust depth to range [0, 255]
