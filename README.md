@@ -1,9 +1,5 @@
 # LiDAR Bike
 
-## Intro
-
-[Description](./Assessment.pdf)
-
 ## Dependencies
 
 ```
